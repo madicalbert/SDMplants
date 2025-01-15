@@ -1,0 +1,369 @@
+---
+title: "Species occurrence data and background points - ANNOTATED"
+author: "Nick McManus"
+date: "2023-07-07"
+output: html_document
+---
+
+```{r setup, echo = TRUE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE)
+library(tidyverse)            ## always
+library(here)                 ## reading/writing data
+library(rgbif)                ## download GBIF data
+library(CoordinateCleaner)    ## filter/clean GBIF data
+library(terra)                ## rast pkg for quicker reprojecting
+library(raster)               ## rast format that plays w/dismo
+#library(enmSdmX)              ## spatially thinning data
+library(dismo)                ## generating background points
+library(lfstat)               ## water year fxn
+```
+
+This script generates and preps occurrence and background data for running the SDMs. First, occurrence records from GBIF and CalFlora are filtered, merged, and spatially thinned. Second, a set of random background points are created for each species. Finally, environmental data are extracted for all occurrence and background points. These "samples with data" files are used for the models in the `kern_sdm` markdown.
+
+# Occurrence Records
+
+## Download/import
+
+This first section will read in, filter, and locally save species occurrence data from GBIF and CalFlora.
+
+### CalFlora
+
+This data was downloaded from the CalFlora website, found here: <https://www.calflora.org/entry/observ.html>
+
+A separate CSV was downloaded for each species.
+
+```{r}
+path = here("data/occ/calflora//")
+names <- c(
+  "a_polycarpa",
+  "p_arborea",
+  "c_pungens",
+  "l_pentachaeta",
+  "p_ciliata",
+  "a_menziesii",
+  "c_lasiophyllus"
+)
+
+## List of "accepted" sources
+sources <- paste(c("BLM",
+                   "Bureau",
+                   "USDA",
+                   "DFW",
+                   "USGS",
+                   "Nature Conservancy",
+                   "TNC",
+                   "CNPS",
+                   "Taylor",
+                   "Hrusa"), collapse = "|")
+
+## Loop through each spp to read in, filter, and export
+for (i in 1:length(names)) {
+  ## Read in data
+  df <- read_csv(paste0(path, "download/", names[i], "_calflora.csv")) %>% 
+    janitor::clean_names()
+  
+  ## filter and keep coords
+  df_filter <- df %>% 
+    ## "LOW" filter criteria
+    filter(location_quality %in% c("high", "medium"),
+           accuracy_square_meters <= 72900,
+           date >= "1999-10-01")
+    ## "HIGH" filter criteria
+    ## Either from CCH or one of the other sources
+    #filter(str_detect(.$source, sources) | dataset == "cch2")
+    
+  ## export
+  write_csv(df_filter, paste0(path, names[i], "_calflora_lowFilter.csv"))
+}
+
+```
+
+```{r}
+barplot(table(df$plant))
+```
+
+
+### GBIF
+
+This script uses the `rgbif` package to directly download species occurrence data from GBIF. To use the `occ_download()` function, this requires setting your GBIF login details. Details on how to set this can be found at: <https://docs.ropensci.org/rgbif/articles/gbif_credentials.html>
+
+```{r}
+## Pull taxon keys from list of spp
+taxon_keys <- name_backbone_checklist(c(
+  ## shrubs
+  "Atriplex polycarpa",
+  "Peritoma arborea",
+  ## forbs
+  "Centromadia pungens",
+  "Layia pentachaeta subsp. albida D.D.Keck", 
+  "Phacelia ciliata Benth.",
+  "Amsinckia menziesii (Lehm.) A.Nelson & J.F.Macbr.",
+  "Caulanthus lasiophyllus (Hook. & Arn.) Payson"
+)) %>% 
+  pull(usageKey)
+
+
+names <- c(
+  "a_polycarpa",
+  "p_arborea",
+  "c_pungens",
+  "l_pentachaeta",
+  "p_ciliata",
+  "a_menziesii",
+  "c_lasiophyllus"
+)
+
+
+## Loop through spp list and save each
+for (i in 1:length(taxon_keys)) {
+  ### download filtered data for A. polycarpa
+  gbif_download <- occ_download(pred_in("taxonKey", taxon_keys[i]),
+                         ## remove geospatial issues
+                         pred("hasGeospatialIssue", FALSE),
+                         ## ensure coords
+                         pred("hasCoordinate", TRUE),
+                         ## remove "absent" occurences
+                         pred("occurrenceStatus", "PRESENT"),
+                         ## within US
+                         pred("country", "US"),
+                         ## within CA
+                         pred("stateProvince", "California"),
+                         ## output as CSV
+                         format = "SIMPLE_CSV",
+                         ## enter your GBIF credentials below:
+                         # user = "username",
+                         # pwd = "password",
+                         # email = "email"
+                         )
+  
+  ### check on download status
+  occ_download_wait(gbif_download)
+  
+  ### import GBIF data into env and filter using CoordinateCleaner pkg
+   species <- occ_download_get(gbif_download, 
+                               path = here("data/occ/gbif/zips/"),
+                               overwrite = TRUE) %>%
+     occ_download_import() %>% 
+     ## set lowercase column names to work with CC
+     setNames(tolower(names(.))) %>% 
+     ## filter out duplicate points
+     distinct(decimallongitude, decimallatitude, 
+              specieskey, datasetkey, .keep_all = TRUE) %>% 
+     ## filter known uncertainty below 270 and keep NAs
+     filter(coordinateuncertaintyinmeters < 270 | 
+              is.na(coordinateuncertaintyinmeters)) %>% 
+     ## known inaccurate default values
+     filter(!coordinateuncertaintyinmeters %in% c(301,3036,999,9999)) %>% 
+     ## remove herbaria/zoo locations
+     cc_inst(lon = "decimallongitude", lat = "decimallatitude",
+             buffer = 270, value = "clean", verbose = TRUE) %>% 
+     ## remove ocean values
+     cc_sea(lon = "decimallongitude", lat = "decimallatitude") %>% 
+     ## remove points before 2000 wy
+     filter(eventdate >= "1999-10-01")
+   
+   ## export file
+   write_csv(species, paste0(here("data/occ/gbif//"),names[i],"_gbif.csv"))
+   
+} ## END LOOP
+```
+
+## Merge and Spatially Thin
+
+BCMv8 data are available at 270m resolution. To avoid biasing the model to oversampled regions, only one occurrence per 270m pixel will be used for extraction. We'll first combine occurrence data by species across all data sources, then thin and filter the data to be used in the SDM model.
+
+```{r}
+## file paths 
+path_gbif <- here("data/occ/gbif//")
+path_calflora <- here("data/occ/calflora//")
+
+## reference raster for thinning
+rast <- rast(here('data/bcmv8/2000_2022/aet2020dec.tif')) %>% 
+  ## match crs to spp occ data
+  project(y = "WGS84")
+
+## spp names
+names <- c(
+  "a_polycarpa",
+  "p_arborea",
+  "c_pungens",
+  "l_pentachaeta",
+  "p_ciliata",
+  "a_menziesii",
+  "c_lasiophyllus"
+)
+
+
+## Read in, merge, thin, and export for each spp on list
+for (i in 1:length(names)) {
+  ## GBIF ---------------------
+  ### If no data for that species, doesn't contribute to merged file
+  if (length(list.files(path_gbif, pattern = names[i])) == 0) {
+    gbif = NULL
+  } else {
+    gbif <- read_csv(paste0(path_gbif, names[i], "_gbif.csv")) %>% 
+      ## only select vars of interest
+      dplyr::select(c(gbifid, decimallatitude, decimallongitude, eventdate)) %>% 
+      ## consistent var names
+      rename(id = gbifid,
+             lat = decimallatitude,
+             lon = decimallongitude,
+             date = eventdate) %>%
+             ## add source
+      mutate(source = "gbif",
+             ## remove time from date
+             date = as.Date(date)) %>% 
+      ## remove points after 2022 wy
+      dplyr::filter(date < "2022-11-01")
+  }
+  
+  ## CalFlora -----------------
+  if (length(list.files(path_calflora, pattern = names[i])) == 0) {
+    calflora = NULL
+  } else {
+    calflora <- read_csv(paste0(path_calflora, names[i], "_calflora_lowFilter.csv")) %>% 
+      dplyr::select(c(id, latitude, longitude, date)) %>% 
+      rename(lat = latitude,
+             lon = longitude) %>% 
+      mutate(source = "calflora") %>% 
+      dplyr::filter(date < "2022-11-01")
+  }
+           
+  ## Merge and thin -----------
+  combo <- rbind(gbif, calflora) %>% 
+    ## Create sep vars for yr and mo
+    mutate(year = lubridate::year(date),
+           month = lubridate::month(date),
+           .before = source)
+  ## Only keep 1pt per rast cell
+  comboThin <- elimCellDuplicates(combo, rast, longLat = c("lon", "lat"))
+  
+  ## Export
+  write_csv(comboThin, paste0(here("data/occ/combined_spp_occ//"), 
+                              names[i],
+                              "_lowFilter.csv"))
+} ## END LOOP
+
+```
+
+# Background points
+
+Random background occurrence points will be generated using the `generate_backOcc()` function (relies on `dismo` and `terra` packages) and exported as a CSV file. Spatially, background points are generated within a 5km range of observed occurrences. Temporally, the relative number of background points per water year matches that of observations. A minimum number of 10,000 points are generated for each species; the exact number slightly varies to accommodate temporal distribution.
+
+```{r}
+## Read in fxn and set parameters --------------------------
+source(here("R/generate_backOcc.R"))
+
+### 5km buffer
+buffer = 5000
+### reference raster
+raster = rast(here("data/natsgo/rasters/natsgo_drclass_270m_CA_2023.tif"))
+### spp names
+names <- c(
+  "a_polycarpa",
+  "p_arborea",
+  "c_pungens",
+  "l_pentachaeta",
+  "p_ciliata",
+  "a_menziesii",
+  "c_lasiophyllus"
+)
+
+## Generate backOccs for each spp in list -------------------
+purrr::map(
+  .x = names,
+  .progress = TRUE,
+  .f = function(names) {
+    ## read in spp occurrence points
+    sppOcc = read_csv(paste0(here("data/occ/combined_spp_occ//"),
+                             names, 
+                             "_lowFilter.csv"))
+    
+    ## Generate pts w/fxn
+    backOcc_pts <- backOcc(sppOcc, raster=raster, buffer=buffer)
+    
+    ## Save
+    write_csv(backOcc_pts, paste0(here("data/background/back_"),
+                                  names,
+                                  "_5km_lowFilter.csv"))
+  })
+
+```
+
+# Extract environmental data
+
+Using the environmental data prepped in `env_data_prep.Rmd`, we'll extract information for each species occurrence and background point based on month and year. The output will be a CSV with environmental data for each point.
+
+```{r}
+## Each spp being modeled
+names <- c(
+  "a_polycarpa",
+  "p_arborea",
+  "c_pungens",
+  "l_pentachaeta",
+  "p_ciliata",
+  "a_menziesii",
+  "c_lasiophyllus"
+)
+
+## Read in fxn
+source(here('R/env_extract.R'))
+
+## Fxn variables
+startYear = 2000
+endYear = 2022
+pathMonth = here("data/bcm/bcmv8_historic/2000_2022_monthly//")
+pathQuarter = here("data/bcm/bcmv8_historic/quarterly_avgs//")
+pathSoil = here("data/natsgo/rasters//")
+```
+
+## Occurrence extraction:
+
+Loop through each species of interest and extract environmental data.
+
+```{r}
+for (i in 1:length(names)) {
+  ## Read in species occurrence df
+  sppOcc <- read_csv(paste0(here('data/occ/combined_spp_occ//'),
+                            names[i],
+                            "_lowFilter.csv"))
+  
+  print(paste0("Working on: ", names[i]))
+  
+  occExtract <- env_extract(occ = sppOcc,
+                            startYear, endYear, 
+                            pathMonth, pathQuarter, pathSoil)
+  
+  write_csv(occExtract, 
+            paste0(here('data/swd//'), names[i], 
+                   "/occExtract_", names[i],
+                   "_soil200cm_lowFilter.csv"))
+}
+```
+
+## Background extraction:
+
+Background point data are also species-specific, so must be looped through list.
+
+```{r}
+for (i in 1:length(names)) {
+  ## Read in background df
+  backOcc <- read_csv(paste0(here("data/background/back_"), 
+                             names[i], "_5km_highFilter.csv")) %>% 
+    janitor::clean_names()
+  
+  print(paste0("Working on: ", names[i]))
+  
+  ## Extract for background points (this will take a while!!)
+  backExtract <- env_extract(occ = backOcc,
+                             startYear, endYear,
+                             pathMonth, pathQuarter, pathSoil,
+                             lon = "x", lat = "y") 
+  
+  write_csv(backExtract, 
+            paste0(here('data/swd//'), names[i], 
+                   "/backExtract_", names[i],
+                   "_soil200cm_highFilter.csv"))
+}
+
+```
